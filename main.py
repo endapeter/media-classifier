@@ -104,6 +104,13 @@ DRY_RUN = False
 # completion time. The average keeps updating as more images are measured.
 TIMING_WARMUP_IMAGES = 3
 
+# Persist each image's VLM analysis to a checkpoint file as soon as it is
+# produced. If the run is interrupted, the next run reuses the checkpointed
+# analyses and only infers the remaining images, instead of starting over.
+# Entries are keyed by source path and validated against file size and
+# modification time, so a changed file is re-analyzed.
+ANALYSIS_CHECKPOINT = True
+
 # If True, copies files instead of moving them.
 # Safer for first runs, but can create duplicates if index is removed.
 COPY_INSTEAD_OF_MOVE = False
@@ -1173,6 +1180,61 @@ def append_log(target_path: Path, entry: Dict[str, Any]) -> None:
 
 
 # ============================================================
+# Analysis checkpoint
+# ============================================================
+
+def load_checkpoint(target_path: Path) -> Dict[str, Dict[str, Any]]:
+    """
+    Load the Phase 1 analysis checkpoint: source path -> VLM analysis.
+    Unlike the move index, this is written during analysis, before any file
+    is moved, so an interrupted run can resume without re-running inference.
+    """
+    checkpoint_path = target_path / "_analysis_checkpoint.json"
+
+    if checkpoint_path.exists():
+        try:
+            data = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            return {}
+
+    return {}
+
+
+def save_checkpoint(target_path: Path, checkpoint: Dict[str, Dict[str, Any]]) -> None:
+    checkpoint_path = target_path / "_analysis_checkpoint.json"
+
+    try:
+        target_path.mkdir(parents=True, exist_ok=True)
+        tmp_path = checkpoint_path.with_suffix(".tmp")
+        tmp_path.write_text(
+            json.dumps(checkpoint, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(checkpoint_path)
+    except Exception as e:
+        print(f"  [Warning] Could not save analysis checkpoint: {e}")
+
+
+def checkpoint_matches_file(img_path: Path, entry: Dict[str, Any]) -> bool:
+    """
+    True if the checkpoint entry still describes this exact file.
+    Guards against reusing an analysis for a file that was replaced or
+    edited after being analyzed.
+    """
+    try:
+        st = img_path.stat()
+    except OSError:
+        return False
+
+    return (
+        entry.get("size") == st.st_size
+        and entry.get("mtime_ns") == st.st_mtime_ns
+    )
+
+
+# ============================================================
 # Model loading
 # ============================================================
 
@@ -1282,10 +1344,25 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
     processor, model = load_model()
 
     index = {} if DRY_RUN else load_index(target_path)
+
+    # Analysis checkpoint: reuse VLM results from an interrupted earlier
+    # run. Entries whose source file no longer exists (already moved in an
+    # earlier run, or removed by the user) are dropped.
+    checkpoint: Dict[str, Dict[str, Any]] = {}
+    if ANALYSIS_CHECKPOINT and not DRY_RUN:
+        checkpoint = load_checkpoint(target_path)
+        checkpoint = {k: v for k, v in checkpoint.items() if Path(k).exists()}
+        if checkpoint:
+            print(
+                f"Found analysis checkpoint with {len(checkpoint)} "
+                f"already-analyzed image(s). Resuming where the last run stopped.\n"
+            )
+
     planned: Set[Path] = set()
 
     success_count = 0
     skipped_count = 0
+    resumed_count = 0
     failed_count = 0
 
     # ------------------------------------------------------------
@@ -1317,6 +1394,30 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
                 print(f"  -> Already processed: {existing_destination}")
                 skipped_count += 1
                 continue
+
+        # Checkpoint resume: reuse the analysis from an interrupted earlier
+        # run and skip inference. Folder assignment still sees the complete
+        # batch, because it runs only after every image is analyzed.
+        cached_entry = checkpoint.get(source_key)
+        if cached_entry is not None and checkpoint_matches_file(img_path, cached_entry):
+            cached_when = cached_entry.get("when") or {}
+            analyzed.append(
+                PlannedImage(
+                    img_path=img_path,
+                    when=WhenInfo(
+                        year=cached_when.get("year"),
+                        date_token=cached_when.get("date_token") or "undated",
+                        source=cached_when.get("source") or "checkpoint",
+                    ),
+                    theme_raw=cached_entry.get("theme_raw") or "",
+                    filename_raw=cached_entry.get("filename_raw"),
+                    prediction=cached_entry.get("prediction") or {},
+                    raw_response=cached_entry.get("raw_response") or "",
+                )
+            )
+            print("  -> Analysis resumed from checkpoint (skipping inference)")
+            resumed_count += 1
+            continue
 
         analysis_start = time.perf_counter()
 
@@ -1393,6 +1494,25 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
                 )
             )
 
+            # Checkpoint the analysis so an interrupted run can resume here.
+            # Failed inference (empty raw_response) is not checkpointed, so
+            # it is retried on the next run instead of keeping the fallback.
+            if ANALYSIS_CHECKPOINT and raw_response:
+                try:
+                    st = img_path.stat()
+                    checkpoint[source_key] = {
+                        "size": st.st_size,
+                        "mtime_ns": st.st_mtime_ns,
+                        "when": when.__dict__,
+                        "theme_raw": theme_raw,
+                        "filename_raw": filename_raw,
+                        "prediction": prediction,
+                        "raw_response": raw_response[:1000],
+                    }
+                    save_checkpoint(target_path, checkpoint)
+                except OSError:
+                    pass
+
         except Exception as e:
             failed_count += 1
             print(f"  [Error] Failed to process {img_path.name}: {e}")
@@ -1465,6 +1585,11 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
                 index[str(img_path)] = str(dest_path)
                 save_index(target_path, index)
 
+                # The analysis is no longer needed once the file has moved.
+                if ANALYSIS_CHECKPOINT:
+                    checkpoint.pop(str(img_path), None)
+                    save_checkpoint(target_path, checkpoint)
+
                 append_log(
                     target_path,
                     {
@@ -1501,6 +1626,7 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
     print("\nSummary:")
     print(f"  Processed/planned: {success_count}")
     print(f"  Skipped already processed: {skipped_count}")
+    print(f"  Resumed from checkpoint: {resumed_count}")
     print(f"  Failed: {failed_count}")
 
     if DRY_RUN:
