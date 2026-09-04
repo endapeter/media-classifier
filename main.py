@@ -1026,23 +1026,33 @@ def load_model() -> Tuple[AutoProcessor, OVModelForVisualCausalLM]:
 
     model = None
     for device in DEVICE_PRIORITY:
-        print(f"Loading OpenVINO model on {device}...")
         # Intel GPUs cap single allocations; large vision-encoder buffers
-        # can exceed that cap unless large allocations are enabled.
-        ov_config = {}
+        # can exceed that cap unless large allocations are enabled. The
+        # option only exists in newer OpenVINO builds, so try it first and
+        # fall back to a plain load if the plugin rejects it.
+        attempts = [{}]
         if device.startswith("GPU"):
-            ov_config["ov::intel_gpu::hint::enable_large_allocations"] = True
-        try:
-            model = OVModelForVisualCausalLM.from_pretrained(
-                MODEL_ID,
-                device=device,
-                ov_config=ov_config,
-            )
-            print(f"Model loaded on {device}.")
+            attempts.insert(0, {"ov::intel_gpu::hint::enable_large_allocations": True})
+
+        for ov_config in attempts:
+            print(f"Loading OpenVINO model on {device}...")
+            try:
+                model = OVModelForVisualCausalLM.from_pretrained(
+                    MODEL_ID,
+                    device=device,
+                    ov_config=ov_config,
+                )
+                print(f"Model loaded on {device}.")
+                break
+            except Exception as e:
+                print(f"Failed to load on {device}: {e}")
+                if ov_config:
+                    print("Retrying without large-allocation hint...")
+                else:
+                    print("Trying next device...")
+
+        if model is not None:
             break
-        except Exception as e:
-            print(f"Failed to load on {device}: {e}")
-            print("Trying next device...")
 
     if model is None:
         raise RuntimeError(
