@@ -48,9 +48,10 @@ import shutil
 import hashlib
 import os
 import subprocess
+import time
 from pathlib import Path
 from dataclasses import dataclass
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional, Tuple, Dict, Any, Set, List
 
 from PIL import Image
@@ -95,6 +96,13 @@ IMAGE_EXTENSIONS = {
 
 # If True, prints what would happen without moving/copying files.
 DRY_RUN = False
+
+# Time estimation: the first image is excluded from timing (it includes the
+# one-time OpenVINO graph compilation and is far slower than every image
+# after it); the next TIMING_WARMUP_IMAGES analyzed images form the initial
+# average, and from then on each analysis prints an estimated remaining and
+# completion time. The average keeps updating as more images are measured.
+TIMING_WARMUP_IMAGES = 3
 
 # If True, copies files instead of moving them.
 # Safer for first runs, but can create duplicates if index is removed.
@@ -293,6 +301,58 @@ def clean_existing_folder_part(part: str) -> str:
         return "folder"
 
     return part
+
+
+# ============================================================
+# Time estimation
+# ============================================================
+
+def format_duration(seconds: float) -> str:
+    """Format seconds as a compact human-readable duration."""
+    seconds = max(0, int(round(seconds)))
+
+    if seconds < 60:
+        return f"{seconds}s"
+
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+
+    return f"{minutes}m {sec:02d}s"
+
+
+def print_time_estimate(
+    durations: List[float],
+    completed: int,
+    total: int,
+) -> None:
+    """
+    Print the estimated remaining time and completion clock time for the
+    images still to be analyzed, based on the average analysis time so far.
+
+    The first image is excluded from the average: it includes the one-time
+    OpenVINO graph compilation and would otherwise dominate the estimate.
+    """
+    samples = durations[1:]
+
+    if len(samples) < TIMING_WARMUP_IMAGES:
+        return
+
+    remaining = total - completed
+
+    if remaining <= 0:
+        return
+
+    avg_seconds = sum(samples) / len(samples)
+    eta_seconds = avg_seconds * remaining
+    eta_time = datetime.now() + timedelta(seconds=eta_seconds)
+
+    print(
+        f"  Est. {format_duration(eta_seconds)} for {remaining} more image(s) "
+        f"(~{avg_seconds:.1f}s/image, done ~{eta_time:%H:%M:%S})"
+    )
 
 
 # ============================================================
@@ -1235,6 +1295,11 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
     # ------------------------------------------------------------
     analyzed: List[PlannedImage] = []
 
+    # Per-image analysis durations, used to estimate the remaining time.
+    # Index 0 is the compile-heavy first image and is excluded from the
+    # average; see print_time_estimate.
+    image_durations: List[float] = []
+
     for idx, img_path in enumerate(image_files, start=1):
         try:
             rel = img_path.relative_to(source_path)
@@ -1252,6 +1317,8 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
                 print(f"  -> Already processed: {existing_destination}")
                 skipped_count += 1
                 continue
+
+        analysis_start = time.perf_counter()
 
         try:
             # ----------------------------------------------------
@@ -1311,6 +1378,9 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
                 filename_raw = Path(str(filename_raw)).stem
 
             print(f"  Date token: {when.date_token} (source: {when.source})")
+
+            image_durations.append(time.perf_counter() - analysis_start)
+            print_time_estimate(image_durations, idx, len(image_files))
 
             analyzed.append(
                 PlannedImage(
