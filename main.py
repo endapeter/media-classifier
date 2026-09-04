@@ -12,8 +12,7 @@ Videos are organized in parallel into:
     Output/
         Videos/
             Year/
-                optional_preserved_subfolders/
-                    original_video_filename.ext
+                original_video_filename.ext
 
 Features:
 - Recursively finds images.
@@ -189,11 +188,9 @@ VIDEO_EXTENSIONS = {
 # Videos go into: OUTPUT_DIRECTORY/Videos/Year/...
 VIDEO_ROOT_FOLDER = "Videos"
 
-# If True:
-# source/trip/video.mp4 -> output/Videos/2023/trip/video.mp4
-# If False:
+# All videos are placed directly inside the year folder:
 # source/trip/video.mp4 -> output/Videos/2023/video.mp4
-VIDEO_PRESERVE_RELATIVE_FOLDERS = True
+VIDEO_PRESERVE_RELATIVE_FOLDERS = False
 
 # Avoid duplicate year folders like Videos/2023/2023/video.mp4
 VIDEO_REMOVE_YEAR_FOLDERS_FROM_PATH = True
