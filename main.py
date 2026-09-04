@@ -5,7 +5,7 @@ Organize images into:
     Output/
         Year/
             Thematic Folder/
-                controlled_filename.ext
+                content_described_filename.ext
 
 Videos are organized in parallel into:
 
@@ -17,8 +17,11 @@ Videos are organized in parallel into:
 
 Features:
 - Recursively finds images.
-- Extracts year/date from EXIF first, then filename/path, then optional model/year fallback.
-- Uses Qwen2.5-VL via OpenVINO to propose a thematic folder and description.
+- The year folder is the only date-based organization; it is derived from EXIF
+  first, with filename/path/model/filesystem used only as year hints.
+- Uses Qwen2.5-VL via OpenVINO to analyze the image content itself and propose
+  both the thematic folder and a content-based filename. Original filenames are
+  never used for naming or theming.
 - Runs on NPU first if available, then GPU, then CPU.
 - Enforces safer folder and filename naming.
 - Supports dry run, copy mode, logging, and resume index.
@@ -92,6 +95,12 @@ SKIP_HIDDEN = True
 # Filesystem dates can be unreliable for copied files.
 USE_FILESYSTEM_DATE_FALLBACK = True
 
+# Downscale images to at most this many pixels on the longest side before
+# VLM inference. Vision-encoder memory scales with pixel count; full-size
+# photos can exceed a GPU's max allocation size and fail inference.
+# Classification/naming quality does not need full resolution.
+MAX_INFERENCE_IMAGE_DIM = 1024
+
 # Allow model to guess a year only if no EXIF/path year was found.
 # Use with caution: VLMs can hallucinate dates.
 ALLOW_MODEL_YEAR_FALLBACK = True
@@ -106,6 +115,9 @@ UNKNOWN_YEAR_FOLDER = "Unknown Year"
 
 # Fallback theme if model output is unusable.
 DEFAULT_THEME_WORDS = ["general", "photo", "collection"]
+
+# Generic camera/filename tokens that carry no content meaning.
+GENERIC_NAME_WORDS = {"img", "image", "photo", "picture", "dsc", "dscn", "untitled"}
 
 # Thematic folder rules.
 MIN_THEME_WORDS = 2
@@ -218,6 +230,11 @@ def words_from_text(text: Any) -> List[str]:
 def remove_year_words(words: List[str]) -> List[str]:
     """Remove standalone year tokens like 2023 from theme words."""
     return [w for w in words if not re.fullmatch(r"(?:19|20)\d{2}", w)]
+
+
+def remove_generic_words(words: List[str]) -> List[str]:
+    """Remove content-free camera/filename tokens like 'img' or 'dsc'."""
+    return [w for w in words if w not in GENERIC_NAME_WORDS]
 
 
 def stable_hash(img_path: Path) -> str:
@@ -614,25 +631,45 @@ def get_video_when(video_path: Path, source_path: Path) -> WhenInfo:
 # VLM prompting and parsing
 # ============================================================
 
+def downscale_for_inference(image: Image.Image) -> Image.Image:
+    """
+    Return a copy capped at MAX_INFERENCE_IMAGE_DIM on the longest side.
+    Vision-encoder memory scales with pixel count; full-size photos can
+    exceed a GPU's max allocation size and fail inference.
+    """
+    w, h = image.size
+    longest = max(w, h)
+    if longest <= MAX_INFERENCE_IMAGE_DIM:
+        return image
+    scale = MAX_INFERENCE_IMAGE_DIM / longest
+    new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
+    return image.resize(new_size, Image.LANCZOS)
+
+
 def get_vlm_prompt() -> str:
-    return """Analyze this image.
+    return """Analyze this image and name it based only on what is actually visible in it.
 Return ONLY one valid JSON object. Do not use Markdown. Do not add comments.
 
 {
   "theme_folder": "several word descriptive theme",
-  "description": "short specific photo description",
+  "filename": "short content based filename",
   "observed_year": null
 }
 
 Rules:
 1. "theme_folder" must be 2-6 words, broad but specific, no year, no slashes.
-   Good examples:
+   Describe the subject/setting of the image, e.g.:
      "family beach vacation"
      "home renovation project"
      "scanned financial documents"
      "winter mountain hiking"
-2. "description" must be 3-8 lowercase words describing the individual photo.
-   Do not include a file extension.
+2. "filename" must be 3-8 lowercase words describing what is actually shown
+   in this specific image (subject, setting, action). No dates, no numbers
+   from timestamps, no file extension, no slashes.
+   Good examples:
+     "sunset over rocky pier"
+     "birthday cake with candles"
+     "group hiking snowy mountain"
 3. "observed_year" must be an integer only if a year is clearly visible in the image.
    Otherwise return null.
 """
@@ -786,25 +823,22 @@ def extract_observed_year(data: Dict[str, Any]) -> Optional[int]:
 # Folder and filename normalization
 # ============================================================
 
-def normalize_theme_folder(
-    raw: Any,
-    fallback_stem: str
-) -> Tuple[str, List[str]]:
+def normalize_theme_folder(raw: Any) -> Tuple[str, List[str]]:
     """
     Convert model output into a safe thematic folder name.
+
+    The folder reflects image content only; if the model output is
+    unusable, a generic theme is used rather than the original filename.
 
     Returns:
         folder_name, theme_words
     """
     words = words_from_text(raw)
     words = remove_year_words(words)
+    words = remove_generic_words(words)
 
     # Remove pure numeric words from theme folders.
     words = [w for w in words if not re.fullmatch(r"\d+", w)]
-
-    if not words:
-        words = remove_year_words(words_from_text(fallback_stem))
-        words = [w for w in words if not re.fullmatch(r"\d+", w)]
 
     if not words:
         words = list(DEFAULT_THEME_WORDS)
@@ -851,14 +885,15 @@ def normalize_theme_folder(
 
 def make_slug(
     text: Any,
-    fallback: str,
     max_words: int = MAX_DESCRIPTION_WORDS
 ) -> str:
-    """Create a lowercase underscore slug for filenames."""
+    """
+    Create a lowercase underscore slug for filenames.
+    Falls back to a generic word if the model output is unusable —
+    never to the original filename.
+    """
     words = remove_year_words(words_from_text(text))
-
-    if not words:
-        words = remove_year_words(words_from_text(fallback))
+    words = remove_generic_words(words)
 
     if not words:
         words = ["photo"]
@@ -875,34 +910,28 @@ def make_slug(
 
 def build_filename(
     img_path: Path,
-    when: WhenInfo,
     theme_words: List[str],
-    description_raw: Any
+    filename_raw: Any
 ) -> str:
     """
-    Build a controlled filename.
+    Build a controlled, content-based filename.
 
     Default scheme:
-        {date_token}_{theme_slug}_{description_slug}_{hash6}.ext
+        {theme_slug}_{description_slug}_{hash6}.ext
+
+    The year lives only in the folder structure; the filename itself
+    describes the image content. A short hash keeps names unique.
 
     Examples:
-        20230715_family_beach_vacation_sunset_on_pier_a1b2c3.jpg
-        2023_family_event_birthday_cake_candles_9f3e2a.jpg
-        undated_general_photo_collection_old_scan_77c1de.jpg
+        family_beach_sunset_over_rocky_pier_a1b2c3.jpg
+        home_renovation_new_kitchen_flooring_9f3e2a.jpg
     """
     ext = img_path.suffix.lower() or ".jpg"
 
-    date_token = when.date_token or "undated"
-
     theme_slug = "_".join(theme_words[:MAX_THEME_SLUG_WORDS_IN_FILENAME]) if theme_words else ""
-    desc_slug = make_slug(description_raw, img_path.stem)
+    desc_slug = make_slug(filename_raw)
 
-    base_parts = [date_token]
-
-    if theme_slug:
-        base_parts.append(theme_slug)
-
-    base_parts.append(desc_slug)
+    base_parts = [theme_slug, desc_slug]
 
     base = "_".join([p for p in base_parts if p])
     base = re.sub(r"_+", "_", base).strip("_")
@@ -998,10 +1027,16 @@ def load_model() -> Tuple[AutoProcessor, OVModelForVisualCausalLM]:
     model = None
     for device in DEVICE_PRIORITY:
         print(f"Loading OpenVINO model on {device}...")
+        # Intel GPUs cap single allocations; large vision-encoder buffers
+        # can exceed that cap unless large allocations are enabled.
+        ov_config = {}
+        if device.startswith("GPU"):
+            ov_config["ov::intel_gpu::hint::enable_large_allocations"] = True
         try:
             model = OVModelForVisualCausalLM.from_pretrained(
                 MODEL_ID,
                 device=device,
+                ov_config=ov_config,
             )
             print(f"Model loaded on {device}.")
             break
@@ -1117,6 +1152,10 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
                 )
                 rgb_image = img.convert("RGB")
 
+            # Downscale before inference: vision-encoder memory scales with
+            # pixel count and full-size photos can exceed GPU allocation limits.
+            inference_image = downscale_for_inference(rgb_image)
+
             # ----------------------------------------------------
             # VLM inference.
             # ----------------------------------------------------
@@ -1124,10 +1163,13 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
                 prediction, raw_response = predict_metadata(
                     model,
                     processor,
-                    rgb_image,
+                    inference_image,
                 )
             except Exception as e:
-                print(f"  [Warning] Model inference failed: {e}")
+                print(
+                    f"  [Warning] Model inference failed: {e}\n"
+                    f"  Falling back to a generic theme/filename for this image."
+                )
                 prediction, raw_response = {}, ""
 
             observed_year = extract_observed_year(prediction)
@@ -1139,7 +1181,8 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
             )
 
             # ----------------------------------------------------
-            # Normalize model output.
+            # Normalize model output. Naming comes from image content
+            # only — never from the original filename.
             # ----------------------------------------------------
             theme_raw = (
                 prediction.get("theme_folder")
@@ -1147,30 +1190,23 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
                 or ""
             )
 
-            description_raw = prediction.get("description")
+            # If the model accidentally returns an extension or path,
+            # use the stem of what it returned.
+            filename_raw = prediction.get("filename") or prediction.get("description")
+            if filename_raw:
+                filename_raw = Path(str(filename_raw)).stem
 
-            if not description_raw:
-                filename_raw = prediction.get("filename")
-                if filename_raw:
-                    # If model accidentally returns extension or path, use stem.
-                    description_raw = Path(str(filename_raw)).stem
+            theme_folder, theme_words = normalize_theme_folder(theme_raw)
 
-            if not description_raw:
-                description_raw = img_path.stem
-
-            theme_folder, theme_words = normalize_theme_folder(
-                theme_raw,
-                img_path.stem,
-            )
-
+            # The year folder is the only date-based organization;
+            # everything below it is thematic.
             year_folder = str(when.year) if when.year is not None else UNKNOWN_YEAR_FOLDER
             dest_folder = target_path / year_folder / theme_folder
 
             filename = build_filename(
                 img_path=img_path,
-                when=when,
                 theme_words=theme_words,
-                description_raw=description_raw,
+                filename_raw=filename_raw,
             )
 
             dest_path = choose_destination(
