@@ -8,7 +8,7 @@ to name and sort your images automatically.
 unorganized_images/  ->  organized_library/
     anything.jpg             2023/
     trip/movie.mp4               Family Beach Vacation/
-    ...                              20230715_family_beach_sunset_on_pier_a1b2c3.jpg
+    ...                              family_beach_sunset_over_rocky_pier_a1b2c3.jpg
                                   2022/
                                     ...
                              Videos/
@@ -18,21 +18,28 @@ unorganized_images/  ->  organized_library/
 
 ## What it does
 
-**Images** are sorted into `organized_library/<Year>/<Thematic Folder>/` with
-controlled filenames:
+**Images** are sorted into `organized_library/<Year>/<Thematic Folder>/`. The
+year folder is the only date-based organization — everything below it is
+thematic, and filenames are derived purely from image content:
 
 ```
-{date}_{theme}_{description}_{hash}.ext
-e.g. 20230715_family_beach_sunset_on_pier_a1b2c3.jpg
+{theme}_{description}_{hash}.ext
+e.g. family_beach_sunset_over_rocky_pier_a1b2c3.jpg
 ```
 
-- The **date/year** is determined in priority order: EXIF date → full date in the
+- The **thematic folder and filename** are proposed by the vision-language
+  model from what it actually sees in the image. The original filename is
+  never used for naming or theming — if the model output is unusable, a generic
+  fallback is used instead.
+- The **year** is determined in priority order: EXIF date → full date in the
   filename → full date in a parent folder → year in the filename → year in a
   parent folder → (optional) a year the model sees in the image → file
-  modification time → `Unknown Year`.
-- The **thematic folder and description** are proposed by the vision-language
-  model, then sanitized into safe folder/file names (no illegal Windows
-  characters, no years in folder names, length limits, collision-proofing).
+  modification time → `Unknown Year`. These filename/path fallbacks only
+  affect the year, never the theme or filename.
+- Images are downscaled to at most 1024 px on the longest side before
+  inference (configurable via `MAX_INFERENCE_IMAGE_DIM`) so the vision
+  encoder fits in GPU memory; this does not affect output quality of the
+  classification.
 
 **Videos** are moved (no AI involved) into `organized_library/Videos/<Year>/`,
 optionally preserving their original subfolder structure.
@@ -163,6 +170,7 @@ All settings are constants near the top of [`main.py`](main.py):
 | `SKIP_HIDDEN` | `True` | Ignore hidden files/folders (`.git`, `.DS_Store`, …) |
 | `USE_FILESYSTEM_DATE_FALLBACK` | `True` | Fall back to file modification time |
 | `ALLOW_MODEL_YEAR_FALLBACK` | `True` | Let the AI guess a year from image content (can be wrong) |
+| `MAX_INFERENCE_IMAGE_DIM` | `1024` | Longest-side pixel cap applied to images before AI analysis (keeps the vision encoder within GPU memory limits) |
 
 ## Notes
 
