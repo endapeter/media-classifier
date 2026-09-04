@@ -22,7 +22,13 @@ Features:
 - Uses Qwen2.5-VL via OpenVINO to analyze the image content itself and propose
   both the thematic folder and a content-based filename. Original filenames are
   never used for naming or theming.
-- Runs on NPU first if available, then GPU, then CPU.
+- A thematic folder is only created when at least MIN_IMAGES_PER_THEME_FOLDER
+  images share it (within a year); sparser themes are merged into a per-year
+  "Assorted Photos" folder so no folder holds just one or two images.
+- Runs on the integrated Intel GPU if available, then CPU. The NPU is not
+  used (its compiler rejects this model's fully dynamic input shapes), and the
+  discrete GPU is not used (the model needs ~13 GB of GPU memory, which would
+  page over PCIe on a 6 GB card).
 - Enforces safer folder and filename naming.
 - Supports dry run, copy mode, logging, and resume index.
 - Moves videos into a parallel Videos/Year structure without AI classification.
@@ -67,9 +73,16 @@ MODEL_ID = (
 )
 
 # Device priority: try each in order, fall back to the next if unavailable.
-# NPU (e.g. Intel AI Boost) first, then the dedicated GPU ("GPU.1" is the
-# discrete card, e.g. RTX 4050; "GPU" is the default/integrated GPU), then CPU.
-DEVICE_PRIORITY = ["NPU", "GPU.1", "GPU", "CPU"]
+# Excluded devices and why:
+# - NPU (Intel AI Boost): its compiler requires statically-shaped or
+#   upper-bounded models; this export has fully unbounded dynamic dimensions,
+#   so compilation always fails on NPU.
+# - GPU.1 (discrete card, e.g. RTX 4050): this model needs ~13 GB of GPU
+#   memory committed. A 6 GB discrete card silently spills the rest into
+#   shared system RAM and pages it over PCIe, making inference pathologically
+#   slow. The integrated GPU ("GPU") uses system memory directly with no VRAM
+#   wall, so it is preferred; "CPU" is the last resort.
+DEVICE_PRIORITY = ["GPU", "CPU"]
 
 IMAGE_EXTENSIONS = {
     ".jpg",
@@ -95,11 +108,15 @@ SKIP_HIDDEN = True
 # Filesystem dates can be unreliable for copied files.
 USE_FILESYSTEM_DATE_FALLBACK = True
 
-# Downscale images to at most this many pixels on the longest side before
-# VLM inference. Vision-encoder memory scales with pixel count; full-size
-# photos can exceed a GPU's max allocation size and fail inference.
-# Classification/naming quality does not need full resolution.
-MAX_INFERENCE_IMAGE_DIM = 1024
+# Fixed inference canvas. Qwen2.5-VL uses native dynamic resolution: the number
+# of vision tokens (and therefore every downstream input shape) depends on the
+# image's exact pixel dimensions. Each distinct shape forces OpenVINO to
+# recompile the graph, which takes minutes for a 7B model. Padding every image
+# onto one fixed canvas makes all shapes constant, so the graph compiles once
+# and every image after the first is fast. Both dimensions are multiples of 28
+# (Qwen2.5-VL patch size 14 x merge size 2) so the processor does not resize.
+INFERENCE_CANVAS_WIDTH = 1008  # 28 * 36
+INFERENCE_CANVAS_HEIGHT = 756  # 28 * 27
 
 # Allow model to guess a year only if no EXIF/path year was found.
 # Use with caution: VLMs can hallucinate dates.
@@ -122,6 +139,14 @@ GENERIC_NAME_WORDS = {"img", "image", "photo", "picture", "dsc", "dscn", "untitl
 # Thematic folder rules.
 MIN_THEME_WORDS = 2
 MAX_THEME_WORDS = 6
+
+# A thematic folder is only created when at least this many images share it
+# (within the same year). Smaller groups are merged into ASSORTED_FOLDER_NAME
+# for that year, so the library never ends up with folders holding just one
+# or two images. Exception: the assorted folder itself may be small if an
+# entire year has fewer than this many images.
+MIN_IMAGES_PER_THEME_FOLDER = 10
+ASSORTED_FOLDER_NAME = "Assorted Photos"
 
 # Filename rules.
 MAX_THEME_SLUG_WORDS_IN_FILENAME = 2
@@ -186,6 +211,17 @@ class WhenInfo:
     year: Optional[int]
     date_token: str
     source: str
+
+
+@dataclass
+class PlannedImage:
+    """An analyzed image awaiting its final folder assignment and move."""
+    img_path: Path
+    when: WhenInfo
+    theme_raw: str
+    filename_raw: str
+    prediction: Dict[str, Any]
+    raw_response: str
 
 
 # ============================================================
@@ -631,19 +667,29 @@ def get_video_when(video_path: Path, source_path: Path) -> WhenInfo:
 # VLM prompting and parsing
 # ============================================================
 
-def downscale_for_inference(image: Image.Image) -> Image.Image:
+def prepare_for_inference(image: Image.Image) -> Image.Image:
     """
-    Return a copy capped at MAX_INFERENCE_IMAGE_DIM on the longest side.
-    Vision-encoder memory scales with pixel count; full-size photos can
-    exceed a GPU's max allocation size and fail inference.
+    Downscale and letterbox onto the fixed inference canvas.
+
+    The image is scaled down to fit inside the canvas (aspect ratio
+    preserved), snapped to a multiple of 28 pixels per side, then centered
+    on a black canvas of exactly INFERENCE_CANVAS_WIDTH x
+    INFERENCE_CANVAS_HEIGHT. Constant input dimensions mean a constant
+    vision-token count, so the OpenVINO graph compiles once instead of
+    once per image.
     """
-    w, h = image.size
-    longest = max(w, h)
-    if longest <= MAX_INFERENCE_IMAGE_DIM:
-        return image
-    scale = MAX_INFERENCE_IMAGE_DIM / longest
-    new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
-    return image.resize(new_size, Image.LANCZOS)
+    canvas_w = INFERENCE_CANVAS_WIDTH
+    canvas_h = INFERENCE_CANVAS_HEIGHT
+
+    scale = min(canvas_w / image.width, canvas_h / image.height, 1.0)
+    new_w = max(28, (round(image.width * scale) // 28) * 28)
+    new_h = max(28, (round(image.height * scale) // 28) * 28)
+
+    resized = image.resize((new_w, new_h), Image.LANCZOS)
+
+    canvas = Image.new("RGB", (canvas_w, canvas_h), (0, 0, 0))
+    canvas.paste(resized, ((canvas_w - new_w) // 2, (canvas_h - new_h) // 2))
+    return canvas
 
 
 def get_vlm_prompt() -> str:
@@ -738,7 +784,8 @@ def parse_json_response(response: str) -> Optional[Dict[str, Any]]:
 def predict_metadata(
     model: OVModelForVisualCausalLM,
     processor: AutoProcessor,
-    image: Image.Image
+    image: Image.Image,
+    max_new_tokens: int = 96,
 ) -> Tuple[Dict[str, Any], str]:
     """
     Run VLM inference and return parsed JSON plus raw response.
@@ -769,7 +816,9 @@ def predict_metadata(
 
     output_ids = model.generate(
         **inputs,
-        max_new_tokens=220,
+        # The expected JSON response is ~50-70 tokens; generation is
+        # autoregressive, so every extra token adds a decode step.
+        max_new_tokens=max_new_tokens,
         do_sample=False,
         num_beams=1,
     )
@@ -881,6 +930,56 @@ def normalize_theme_folder(raw: Any) -> Tuple[str, List[str]]:
             name = " ".join(w.capitalize() for w in words)
 
     return name, words
+
+
+def assign_theme_folders(
+    records: List[PlannedImage],
+) -> List[Tuple[PlannedImage, str, List[str]]]:
+    """
+    Decide the final thematic folder for each analyzed image.
+
+    Returns (record, folder_name, theme_words) triples. A theme that would
+    hold fewer than MIN_IMAGES_PER_THEME_FOLDER images within its year is
+    merged into ASSORTED_FOLDER_NAME instead, so no thematic folder ends up
+    with just one or two images.
+
+    Note: theme_words always describe the image's own theme; they are kept
+    as-is for merged images so filenames still reflect the content.
+    """
+    folder_counts: Dict[Tuple[Optional[int], str], int] = {}
+    resolved: List[Tuple[PlannedImage, str, List[str]]] = []
+
+    for record in records:
+        theme_folder, theme_words = normalize_theme_folder(record.theme_raw)
+        resolved.append((record, theme_folder, theme_words))
+        key = (record.when.year, theme_folder)
+        folder_counts[key] = folder_counts.get(key, 0) + 1
+
+    merged_count = 0
+    final: List[Tuple[PlannedImage, str, List[str]]] = []
+    for record, theme_folder, theme_words in resolved:
+        if folder_counts[(record.when.year, theme_folder)] >= MIN_IMAGES_PER_THEME_FOLDER:
+            final.append((record, theme_folder, theme_words))
+        else:
+            merged_count += 1
+            final.append((record, ASSORTED_FOLDER_NAME, theme_words))
+
+    if merged_count:
+        merged_names = sorted(
+            folder
+            for (_, folder), count in folder_counts.items()
+            if count < MIN_IMAGES_PER_THEME_FOLDER
+        )
+        print(
+            f"\nMerging {merged_count} images from {len(merged_names)} folders "
+            f"with fewer than {MIN_IMAGES_PER_THEME_FOLDER} images into "
+            f"'{ASSORTED_FOLDER_NAME}':"
+        )
+        for name in merged_names:
+            print(f"  - {name}")
+        print()
+
+    return final
 
 
 def make_slug(
@@ -1132,6 +1231,13 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
     skipped_count = 0
     failed_count = 0
 
+    # ------------------------------------------------------------
+    # Phase 1: analyze every image without moving anything yet.
+    # Folder assignment needs the complete picture, because a thematic
+    # folder is only kept when enough images share it.
+    # ------------------------------------------------------------
+    analyzed: List[PlannedImage] = []
+
     for idx, img_path in enumerate(image_files, start=1):
         try:
             rel = img_path.relative_to(source_path)
@@ -1162,9 +1268,10 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
                 )
                 rgb_image = img.convert("RGB")
 
-            # Downscale before inference: vision-encoder memory scales with
-            # pixel count and full-size photos can exceed GPU allocation limits.
-            inference_image = downscale_for_inference(rgb_image)
+            # Letterbox onto the fixed inference canvas so every image
+            # produces identical input shapes; otherwise OpenVINO
+            # recompiles the graph for each new image geometry.
+            inference_image = prepare_for_inference(rgb_image)
 
             # ----------------------------------------------------
             # VLM inference.
@@ -1206,7 +1313,48 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
             if filename_raw:
                 filename_raw = Path(str(filename_raw)).stem
 
-            theme_folder, theme_words = normalize_theme_folder(theme_raw)
+            print(f"  Date token: {when.date_token} (source: {when.source})")
+
+            analyzed.append(
+                PlannedImage(
+                    img_path=img_path,
+                    when=when,
+                    theme_raw=theme_raw,
+                    filename_raw=filename_raw,
+                    prediction=prediction,
+                    raw_response=raw_response,
+                )
+            )
+
+        except Exception as e:
+            failed_count += 1
+            print(f"  [Error] Failed to process {img_path.name}: {e}")
+
+            if not DRY_RUN:
+                append_log(
+                    target_path,
+                    {
+                        "timestamp": datetime.now().isoformat(),
+                        "source": str(img_path),
+                        "error": str(e),
+                    },
+                )
+
+    # ------------------------------------------------------------
+    # Phase 2: assign folders (merging sparse themes), then
+    # move/copy the files.
+    # ------------------------------------------------------------
+    assignments = assign_theme_folders(analyzed)
+
+    for idx, (record, theme_folder, theme_words) in enumerate(assignments, start=1):
+        img_path = record.img_path
+        when = record.when
+
+        try:
+            try:
+                rel = img_path.relative_to(source_path)
+            except ValueError:
+                rel = img_path
 
             # The year folder is the only date-based organization;
             # everything below it is thematic.
@@ -1216,7 +1364,7 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
             filename = build_filename(
                 img_path=img_path,
                 theme_words=theme_words,
-                filename_raw=filename_raw,
+                filename_raw=record.filename_raw,
             )
 
             dest_path = choose_destination(
@@ -1230,7 +1378,7 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
             except ValueError:
                 shown_destination = dest_path
 
-            print(f"  Date token: {when.date_token} (source: {when.source})")
+            print(f"[{idx}/{len(assignments)}] Organizing: {rel}")
             print(f"  Theme folder: {theme_folder}")
             print(f"  Planned destination: {shown_destination}")
 
@@ -1247,7 +1395,7 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
                     shutil.move(str(img_path), str(dest_path))
                     action = "moved"
 
-                index[source_key] = str(dest_path)
+                index[str(img_path)] = str(dest_path)
                 save_index(target_path, index)
 
                 append_log(
@@ -1259,8 +1407,8 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
                         "action": action,
                         "when": when.__dict__,
                         "theme_folder": theme_folder,
-                        "prediction": prediction,
-                        "raw_response": raw_response[:1000],
+                        "prediction": record.prediction,
+                        "raw_response": record.raw_response[:1000],
                     },
                 )
 
