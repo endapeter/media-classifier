@@ -1,0 +1,11 @@
+# make sure the huge model isn't actually comitted
+/models/*
+!/models/.gitkeep
+
+# Python virtual environment and caches
+/.venv/
+__pycache__/
+
+# Personal data folders
+/unorganized_images/
+/organized_library/
