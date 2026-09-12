@@ -58,6 +58,23 @@ from PIL import Image
 from optimum.intel.openvino import OVModelForVisualCausalLM
 from transformers import AutoProcessor
 
+# ============================================================
+# Optional HEIC/HEIF support
+# ============================================================
+HEIC_AVAILABLE = False
+
+try:
+    try:
+        from pillow_heif import register_heif_opener
+    except ImportError:
+        from pi_heif import register_heif_opener
+
+    register_heif_opener()
+    HEIC_AVAILABLE = True
+except Exception as e:
+    print(f"[Warning] HEIC/HEIF support disabled: {e}")
+    print("         Install HEIC support with: python -m pip install pillow-heif")
+
 
 # ============================================================
 # Configuration
@@ -93,6 +110,9 @@ IMAGE_EXTENSIONS = {
     ".tiff",
     ".tif",
 }
+
+if HEIC_AVAILABLE:
+    IMAGE_EXTENSIONS.update({".heic", ".heif"})
 
 # If True, prints what would happen without moving/copying files.
 DRY_RUN = False
