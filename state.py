@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from config import CHECKPOINT_SCHEMA
-from ui import print
+from ui import warn
 
 
 # ============================================================
@@ -41,7 +41,7 @@ def save_index(target_path: Path, index: Dict[str, str]) -> None:
         tmp_path.replace(index_path)
 
     except Exception as e:
-        print(f"  [Warning] Could not save index: {e}")
+        warn(f"could not save index: {e}")
 
 
 def append_log(target_path: Path, entry: Dict[str, Any]) -> None:
@@ -54,7 +54,7 @@ def append_log(target_path: Path, entry: Dict[str, Any]) -> None:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     except Exception as e:
-        print(f"  [Warning] Could not write log: {e}")
+        warn(f"could not write log: {e}")
 
 
 # ============================================================
@@ -95,7 +95,7 @@ def save_checkpoint(target_path: Path, checkpoint: Dict[str, Dict[str, Any]]) ->
         tmp_path.replace(checkpoint_path)
 
     except Exception as e:
-        print(f"  [Warning] Could not save analysis checkpoint: {e}")
+        warn(f"could not save analysis checkpoint: {e}")
 
 
 def checkpoint_matches_file(img_path: Path, entry: Dict[str, Any]) -> bool:

@@ -36,8 +36,10 @@ try:
     register_heif_opener()
     HEIC_AVAILABLE = True
 except Exception as e:
-    print(f"[Warning] HEIC/HEIF support disabled: {e}")
-    print("         Install HEIC support with: python -m pip install pillow-heif")
+    from ui import warn
+
+    warn(f"HEIC/HEIF support disabled: {e}")
+    warn("install with: python -m pip install pillow-heif")
 
 
 # ============================================================

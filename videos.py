@@ -34,7 +34,7 @@ from helpers import clean_existing_folder_part, valid_year
 from naming import choose_destination
 from records import WhenInfo
 from state import append_log, load_index, save_index
-from ui import print
+from ui import counter, error, fmt_int, kv, section
 
 
 # ============================================================
@@ -239,7 +239,8 @@ def process_videos(source_dir: str, target_dir: str) -> None:
         except OSError:
             continue
 
-    print(f"Found {len(video_files)} videos in {source_path}.\n")
+    section("Videos")
+    print(f"Found {fmt_int(len(video_files))} video(s) in {source_path}")
 
     if not video_files:
         return
@@ -259,15 +260,14 @@ def process_videos(source_dir: str, target_dir: str) -> None:
             except ValueError:
                 rel = video_path
 
-            print(f"[{idx}/{len(video_files)}] Video: {rel}")
-
+            tag = counter(idx, len(video_files))
             source_key = str(video_path)
 
             if not DRY_RUN and source_key in index:
                 existing_destination = Path(index[source_key])
 
                 if existing_destination.exists():
-                    print(f"  -> Already processed: {existing_destination}")
+                    print(f"{tag} {rel}  (already processed)")
                     skipped_count += 1
                     continue
 
@@ -311,8 +311,7 @@ def process_videos(source_dir: str, target_dir: str) -> None:
                 except ValueError:
                     shown_destination = dest_path
 
-                print(f"  Date token: {when.date_token} (source: {when.source})")
-                print(f"  Planned destination: {shown_destination}")
+                print(f"{tag} {rel} -> {shown_destination}")
 
                 if not DRY_RUN:
                     dest_folder.mkdir(parents=True, exist_ok=True)
@@ -339,14 +338,12 @@ def process_videos(source_dir: str, target_dir: str) -> None:
                         },
                     )
 
-                    print(f"  -> {action.capitalize()} to: {shown_destination}")
-
                 planned.add(dest_path)
                 success_count += 1
 
             except Exception as e:
                 failed_count += 1
-                print(f"  [Error] Failed to process video {video_path.name}: {e}")
+                error(f"failed to process video {video_path.name}: {e}")
 
                 if not DRY_RUN:
                     append_log(
@@ -367,7 +364,7 @@ def process_videos(source_dir: str, target_dir: str) -> None:
             except ValueError:
                 shown = video_path
 
-            print(f"  [Error] Unexpected failure while processing video {shown}: {e}")
+            error(f"unexpected failure while processing video {shown}: {e}")
 
             if not DRY_RUN:
                 append_log(
@@ -381,10 +378,11 @@ def process_videos(source_dir: str, target_dir: str) -> None:
                     },
                 )
 
-    print("\nVideo summary:")
-    print(f"  Processed/planned: {success_count}")
-    print(f"  Skipped already processed: {skipped_count}")
-    print(f"  Failed: {failed_count}")
+    section("Video summary")
+
+    kv("Processed", fmt_int(success_count))
+    kv("Skipped", fmt_int(skipped_count))
+    kv("Failed", fmt_int(failed_count))
 
     if DRY_RUN:
-        print("\nDry run complete. No videos were moved or copied.")
+        print("  dry run - no videos were moved or copied")

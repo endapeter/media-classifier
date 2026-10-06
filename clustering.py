@@ -30,7 +30,7 @@ from config import (
 )
 from naming import sanitize_event_name, sanitize_slot_words
 from records import ImageFacts
-from ui import print
+from ui import counter, fmt_int, warn
 from vlm import (
     OVModelForVisualCausalLM,
     get_event_prompt,
@@ -93,7 +93,7 @@ def embed_images(
         all_features.append(features.cpu().numpy())
 
         done = min(start + EMBED_BATCH_SIZE, len(image_paths))
-        print(f"  Embedded {done}/{len(image_paths)} images")
+        print(f"Embedded {fmt_int(done)}/{fmt_int(len(image_paths))} images")
 
     return np.vstack(all_features)
 
@@ -152,7 +152,7 @@ def cluster_images(
             cluster_labels = clustering.fit_predict(embeddings[idxs])
 
         except Exception as e:
-            print(f"  [Warning] Clustering failed for {key}: {e}")
+            warn(f"clustering failed for {key}: {e}")
             cluster_labels = list(range(len(idxs)))
 
         for i, label in zip(idxs, cluster_labels):
@@ -240,8 +240,6 @@ def name_events(
     for idx, cluster_id in enumerate(ordered, start=1):
         paths = clusters[cluster_id]
 
-        print(f"[{idx}/{len(ordered)}] Naming event for {len(paths)} image(s)")
-
         try:
             sheet = build_contact_sheet(paths)
             prediction, _ = predict_metadata(
@@ -260,11 +258,13 @@ def name_events(
 
             if name:
                 names[cluster_id] = name
-                print(f"  Event name: {name}")
+                print(
+                    f"{counter(idx, len(ordered))} {len(paths)} image(s) -> {name}"
+                )
             else:
-                print("  [Warning] Could not name this event; images will use a fallback.")
+                warn("could not name this event; images will use a fallback")
 
         except Exception as e:
-            print(f"  [Warning] Event naming failed: {e}")
+            warn(f"event naming failed: {e}")
 
     return names

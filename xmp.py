@@ -15,7 +15,7 @@ from config import CATEGORY_VOCABULARY
 from helpers import words_from_text
 from naming import sanitize_slot_words
 from records import PlannedImage
-from ui import print
+from ui import warn
 
 
 def _xmp_li(value: Any) -> str:
@@ -185,5 +185,5 @@ def write_xmp_sidecar(record: PlannedImage, dest_path: Path) -> Optional[Path]:
         return sidecar_path
 
     except Exception as e:
-        print(f"  [Warning] Could not write XMP sidecar: {e}")
+        warn(f"could not write XMP sidecar: {e}")
         return None

@@ -32,6 +32,7 @@ from config import (
     DRY_RUN,
     IMAGE_EXTENSIONS,
     MAX_TOTAL_PATH_LENGTH,
+    PROCESS_VIDEOS,
     SKIP_HIDDEN,
     UNKNOWN_YEAR_FOLDER,
     USE_FILESYSTEM_DATE_FALLBACK,
@@ -48,7 +49,7 @@ from facts import (
     get_filesystem_when,
     reverse_geocode_batch,
 )
-from helpers import print_time_estimate, valid_year
+from helpers import time_estimate, valid_year
 from naming import (
     assign_sequence_numbers,
     choose_destination,
@@ -64,7 +65,7 @@ from state import (
     save_checkpoint,
     save_index,
 )
-from ui import print
+from ui import counter, error, fmt_int, kv, note, section, warn
 from vlm import (
     extract_observed_year,
     load_model,
@@ -91,8 +92,25 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
     except AttributeError:
         target_is_inside_source = str(target_path).startswith(str(source_path) + os.sep)
 
+    # ------------------------------------------------------------
+    # Run header: what this run will do, before anything happens.
+    # ------------------------------------------------------------
+
+    if DRY_RUN:
+        mode = "dry run (nothing will be moved or copied)"
+    elif COPY_INSTEAD_OF_MOVE:
+        mode = "copy (originals are kept)"
+    else:
+        mode = "move"
+
+    print("Image Library Organizer")
+    print(f"  Source  {source_path}")
+    print(f"  Output  {target_path}")
+    print(f"  Mode    {mode}")
+    print(f"  Videos  {'included' if PROCESS_VIDEOS else 'skipped'}")
+
     if target_is_inside_source:
-        print("Notice: output directory is inside source directory. Output files will be skipped during scanning.")
+        warn("output directory is inside source; output files are skipped while scanning")
 
     # ------------------------------------------------------------
     # Find images recursively.
@@ -127,10 +145,13 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
         except OSError:
             continue
 
-    print(f"Found {len(image_files)} images in {source_path}.\n")
+    section("Scanning")
+    print(f"Found {fmt_int(len(image_files))} image(s) in {source_path}")
 
     if not image_files:
         return
+
+    section("Loading models")
 
     processor, model = load_model()
     embed_model, embed_processor = load_embedder()
@@ -147,9 +168,9 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
         checkpoint = {k: v for k, v in checkpoint.items() if Path(k).exists()}
 
     if checkpoint:
-        print(
-            f"Found analysis checkpoint with {len(checkpoint)} "
-            f"already-analyzed image(s). Resuming where the last run stopped.\n"
+        note(
+            f"analysis checkpoint found with {fmt_int(len(checkpoint))} "
+            f"already-analyzed image(s); resuming where the last run stopped"
         )
 
     skipped_count = 0
@@ -162,6 +183,8 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
     # ------------------------------------------------------------
 
     pending: List[Tuple[Path, ImageFacts]] = []
+
+    section("Reading metadata")
 
     for idx, img_path in enumerate(image_files, start=1):
         try:
@@ -180,14 +203,14 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
             except ValueError:
                 rel = img_path
 
-            print(f"[{idx}/{len(image_files)}] Reading metadata: {rel}")
+            print(f"{counter(idx, len(image_files))} {rel}")
 
             try:
                 with Image.open(img_path) as img:
                     facts = extract_image_facts(img_path, img, source_path)
             except Exception as e:
                 failed_count += 1
-                print(f"  [Error] Failed to process {img_path.name}: {e}")
+                error(f"failed to process {img_path.name}: {e}")
 
                 if not DRY_RUN:
                     append_log(
@@ -221,7 +244,7 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
             except ValueError:
                 shown = img_path
 
-            print(f"  [Error] Unexpected failure while reading {shown}: {e}")
+            error(f"unexpected failure while reading {shown}: {e}")
 
             if not DRY_RUN:
                 append_log(
@@ -239,7 +262,7 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
         geo_coords = {facts.gps for _, facts in pending if facts.gps is not None}
 
         if geo_coords:
-            print(f"\nReverse geocoding {len(geo_coords)} unique GPS location(s)...")
+            print(f"Reverse geocoding {fmt_int(len(geo_coords))} unique GPS location(s)...")
 
             geocoded = reverse_geocode_batch(geo_coords)
 
@@ -255,7 +278,9 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
     # (never across year-month boundaries).
     # ------------------------------------------------------------
 
-    print(f"\nEmbedding {len(pending)} image(s) for event clustering...")
+    section("Event clustering")
+
+    print(f"Embedding {fmt_int(len(pending))} image(s)...")
 
     embeddings = embed_images(
         embed_model,
@@ -270,12 +295,14 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
     for (img_path, _), cluster_id in zip(pending, cluster_ids):
         clusters.setdefault(cluster_id, []).append(img_path)
 
-    print(f"\nFound {len(clusters)} event cluster(s).")
+    print(f"Found {fmt_int(len(clusters))} event cluster(s).")
 
     # ------------------------------------------------------------
     # Phase 3b: one Qwen call per cluster, viewing a contact sheet of
     # its frames, names the event ("Newborn Photos").
     # ------------------------------------------------------------
+
+    section("Event naming")
 
     event_names = name_events(model, processor, clusters)
 
@@ -287,9 +314,11 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
     analyzed: List[PlannedImage] = []
     resumed_count = 0
 
+    section("Analyzing images")
+
     # Per-image analysis durations, used to estimate the remaining time.
     # Index 0 is the compile-heavy first image and is excluded from the
-    # average; see print_time_estimate.
+    # average; see time_estimate.
     image_durations: List[float] = []
 
     for idx, ((img_path, facts), cluster_id) in enumerate(
@@ -302,8 +331,7 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
             except ValueError:
                 rel = img_path
 
-            print(f"[{idx}/{len(pending)}] Analyzing: {rel}")
-
+            tag = counter(idx, len(pending))
             source_key = str(img_path)
 
             # Checkpoint resume: reuse the analysis from an interrupted
@@ -311,6 +339,8 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
             cached_entry = checkpoint.get(source_key)
 
             if cached_entry is not None and checkpoint_matches_file(img_path, cached_entry):
+                print(f"{tag} {rel}  (resumed from checkpoint)")
+
                 analyzed.append(
                     PlannedImage(
                         img_path=img_path,
@@ -321,9 +351,10 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
                     )
                 )
 
-                print("  -> Analysis resumed from checkpoint (skipping inference)")
                 resumed_count += 1
                 continue
+
+            print(f"{tag} {rel}")
 
             analysis_start = time.perf_counter()
 
@@ -345,9 +376,9 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
                         inference_image,
                     )
                 except Exception as e:
-                    print(
-                        f"  [Warning] Model inference failed: {e}\n"
-                        f"  Falling back to a generic naming for this image."
+                    warn(
+                        f"model inference failed: {e}; "
+                        f"falling back to a generic naming for this image"
                     )
                     slots, raw_response = {}, ""
 
@@ -367,13 +398,16 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
                                 source="model",
                             )
 
-                print(
-                    f"  Date token: {facts.when.date_token} "
-                    f"(source: {facts.when.source})"
-                )
-
                 image_durations.append(time.perf_counter() - analysis_start)
-                print_time_estimate(image_durations, idx, len(pending))
+
+                # Detail line aligned under the filename of the line above.
+                detail = f"{facts.when.date_token} ({facts.when.source})"
+                eta = time_estimate(image_durations, idx, len(pending))
+
+                if eta:
+                    detail += f"  |  {eta}"
+
+                print(" " * (len(tag) + 1) + detail)
 
                 analyzed.append(
                     PlannedImage(
@@ -407,7 +441,7 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
 
             except Exception as e:
                 failed_count += 1
-                print(f"  [Error] Failed to process {img_path.name}: {e}")
+                error(f"failed to process {img_path.name}: {e}")
 
                 if not DRY_RUN:
                     append_log(
@@ -426,7 +460,7 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
             except ValueError:
                 shown = img_path
 
-            print(f"  [Error] Unexpected failure while analyzing {shown}: {e}")
+            error(f"unexpected failure while analyzing {shown}: {e}")
 
             if not DRY_RUN:
                 append_log(
@@ -488,7 +522,7 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
 
     assign_sequence_numbers(moves)
 
-    print("\nEvent preview:")
+    section("Event preview")
 
     event_sizes: Dict[Tuple[str, str], int] = {}
 
@@ -496,13 +530,15 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
         key = (move["year_folder"], move["event_folder"])
         event_sizes[key] = event_sizes.get(key, 0) + 1
 
-    for year_folder, event_folder in sorted(event_sizes):
-        print(
-            f"  {year_folder}/{event_folder} "
-            f"— {event_sizes[(year_folder, event_folder)]} image(s)"
-        )
+    label_width = max(
+        (len(f"{year}/{event}") for year, event in event_sizes),
+        default=0,
+    )
 
-    print()
+    for year_folder, event_folder in sorted(event_sizes):
+        label = f"{year_folder}/{event_folder}"
+        count = event_sizes[(year_folder, event_folder)]
+        print(f"  {label:<{label_width}}  {fmt_int(count)} image(s)")
 
     # ------------------------------------------------------------
     # Phase 7: move/copy files and write XMP sidecars.
@@ -510,6 +546,8 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
 
     planned: Set[Path] = set()
     success_count = 0
+
+    section("Planning moves" if DRY_RUN else "Moving files")
 
     for idx, move in enumerate(moves, start=1):
         record = move["record"]
@@ -535,11 +573,7 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
             except ValueError:
                 shown_destination = dest_path
 
-            print(f"[{idx}/{len(moves)}] Organizing: {rel}")
-            print(
-                f"  Event folder: {move['year_folder']}/{move['event_folder']}"
-            )
-            print(f"  Planned destination: {shown_destination}")
+            print(f"{counter(idx, len(moves))} {rel} -> {shown_destination}")
 
             # ----------------------------------------------------
             # Move/copy file, then write its XMP sidecar.
@@ -554,6 +588,8 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
                 else:
                     shutil.move(str(img_path), str(dest_path))
                     action = "moved"
+                # The "-> destination" shown on the line above is the result;
+                # the action itself (move/copy) is stated in the run header.
 
                 index[str(img_path)] = str(dest_path)
                 save_index(target_path, index)
@@ -582,13 +618,11 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
                     },
                 )
 
-                print(f"  -> {action.capitalize()} to: {shown_destination}")
-
             planned.add(dest_path)
             success_count += 1
         except Exception as e:
             failed_count += 1
-            print(f"  [Error] Failed to process {img_path.name}: {e}")
+            error(f"failed to process {img_path.name}: {e}")
 
             if not DRY_RUN:
                 append_log(
@@ -600,11 +634,12 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
                     },
                 )
 
-    print("\nSummary:")
-    print(f"  Processed/planned: {success_count}")
-    print(f"  Skipped already processed: {skipped_count}")
-    print(f"  Resumed from checkpoint: {resumed_count}")
-    print(f"  Failed: {failed_count}")
+    section("Summary")
+
+    kv("Processed", fmt_int(success_count))
+    kv("Skipped", fmt_int(skipped_count))
+    kv("Resumed", fmt_int(resumed_count))
+    kv("Failed", fmt_int(failed_count))
 
     if DRY_RUN:
-        print("\nDry run complete. No files were moved or copied.")
+        note("dry run - no files were moved or copied")

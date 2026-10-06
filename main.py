@@ -20,7 +20,6 @@ Output/
 The tool is split into thematic modules:
 
     config.py     settings, environment bootstrap (HF cache, HEIC support)
-    ui.py         aesthetic terminal layer; exports the styled `print`
     records.py    WhenInfo / ImageFacts / PlannedImage dataclasses
     helpers.py    word cleanup, year validation, stable hashing, ETA print
     facts.py      EXIF time/GPS/camera, filename/path dates, geocoding
@@ -29,6 +28,7 @@ The tool is split into thematic modules:
     naming.py     filename/folder composition (pure code from slots)
     xmp.py        XMP sidecar writer (ISO 16684-1, Dublin Core, IPTC)
     state.py      move index, audit log, analysis checkpoint
+    ui.py         plain-text console output helpers (sections, counters)
     organizer.py   the image pipeline (phases 1-7)
     videos.py     video dating and moving (no AI)
 
@@ -56,18 +56,10 @@ High-level behavior:
 import config  # noqa: F401  (must run first: HF cache + HEIC bootstrap)
 from config import OUTPUT_DIRECTORY, SOURCE_DIRECTORY
 from organizer import organize_image_library
-from ui import _ui_intro
 from videos import process_videos
 
 
 if __name__ == "__main__":
-    try:
-        _ui_intro()
-    except KeyboardInterrupt:
-        raise
-    except Exception:
-        pass
-
     organize_image_library(
         source_dir=SOURCE_DIRECTORY,
         target_dir=OUTPUT_DIRECTORY,

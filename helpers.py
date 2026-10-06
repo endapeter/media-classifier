@@ -7,10 +7,9 @@ import hashlib
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Optional
 
 from config import CURRENT_YEAR, GENERIC_NAME_WORDS, TIMING_WARMUP_IMAGES
-from ui import print
 
 
 def valid_year(value: Any) -> bool:
@@ -105,14 +104,15 @@ def format_duration(seconds: float) -> str:
     return f"{minutes}m {sec:02d}s"
 
 
-def print_time_estimate(
+def time_estimate(
     durations: List[float],
     completed: int,
     total: int,
-) -> None:
+) -> Optional[str]:
     """
-    Print the estimated remaining time and completion clock time for the
-    images still to be analyzed, based on the average analysis time so far.
+    Return a one-line remaining-time estimate for the images still to be
+    analyzed, based on the average analysis time so far, or None when
+    there are not enough samples yet.
 
     The first image is excluded from the average: it includes the one-time
     OpenVINO graph compilation and would otherwise dominate the estimate.
@@ -120,18 +120,18 @@ def print_time_estimate(
     samples = durations[1:]
 
     if len(samples) < TIMING_WARMUP_IMAGES:
-        return
+        return None
 
     remaining = total - completed
 
     if remaining <= 0:
-        return
+        return None
 
     avg_seconds = sum(samples) / len(samples)
     eta_seconds = avg_seconds * remaining
     eta_time = datetime.now() + timedelta(seconds=eta_seconds)
 
-    print(
-        f"  Est. {format_duration(eta_seconds)} for {remaining} more image(s) "
-        f"(~{avg_seconds:.1f}s/image, done ~{eta_time:%H:%M:%S})"
+    return (
+        f"est. {format_duration(eta_seconds)} for {remaining:,} more "
+        f"(~{avg_seconds:.1f}s/image, done ~{eta_time:%H:%M})"
     )

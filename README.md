@@ -180,7 +180,7 @@ The tool is a set of flat modules, run with `python main.py`:
 | --- | --- |
 | [`main.py`](main.py) | Entry point |
 | [`config.py`](config.py) | All settings; environment bootstrap (HF cache, HEIC support) |
-| [`ui.py`](ui.py) | Aesthetic terminal layer; exports the styled `print` |
+| [`ui.py`](ui.py) | Plain-text console output helpers (sections, counters, markers) |
 | [`records.py`](records.py) | `WhenInfo` / `ImageFacts` / `PlannedImage` dataclasses |
 | [`helpers.py`](helpers.py) | Word cleanup, year validation, stable hashing, ETA printing |
 | [`facts.py`](facts.py) | EXIF time/GPS/camera, filename/path dates, offline geocoding |

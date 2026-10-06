@@ -18,7 +18,7 @@ from config import (
     YEAR_RE,
 )
 from helpers import valid_year
-from ui import print
+from ui import note, warn
 
 from optimum.intel.openvino import OVModelForVisualCausalLM
 from transformers import AutoProcessor
@@ -284,7 +284,7 @@ def load_model() -> Tuple[AutoProcessor, OVModelForVisualCausalLM]:
             attempts.insert(0, {"ov::intel_gpu::hint::enable_large_allocations": True})
 
         for ov_config in attempts:
-            print(f"Loading OpenVINO model on {device}...")
+            print(f"Loading model on {device}...")
 
             try:
                 model = OVModelForVisualCausalLM.from_pretrained(
@@ -296,12 +296,12 @@ def load_model() -> Tuple[AutoProcessor, OVModelForVisualCausalLM]:
                 break
 
             except Exception as e:
-                print(f"Failed to load on {device}: {e}")
+                warn(f"failed to load on {device}: {e}")
 
                 if ov_config:
-                    print("Retrying without large-allocation hint...")
+                    note("retrying without large-allocation hint...")
                 else:
-                    print("Trying next device...")
+                    note("trying next device...")
 
         if model is not None:
             break

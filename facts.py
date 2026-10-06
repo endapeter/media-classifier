@@ -15,7 +15,7 @@ from PIL import Image
 from config import FULL_DATE_RE, YEAR_RE
 from helpers import valid_year
 from records import ImageFacts, WhenInfo
-from ui import print
+from ui import warn
 
 
 # ============================================================
@@ -371,9 +371,9 @@ def reverse_geocode_batch(
     """
     if _reverse_geocoder is None or not coords:
         if _reverse_geocoder is None and coords:
-            print(
-                f"[Warning] reverse_geocoder unavailable ({_rg_error}); "
-                f"{len(coords)} GPS location(s) will not be geocoded."
+            warn(
+                f"reverse_geocoder unavailable ({_rg_error}); "
+                f"{len(coords)} GPS location(s) will not be geocoded"
             )
 
         return {}
@@ -393,5 +393,5 @@ def reverse_geocode_batch(
         return resolved
 
     except Exception as e:
-        print(f"[Warning] Reverse geocoding failed: {e}")
+        warn(f"reverse geocoding failed: {e}")
         return {}
