@@ -3,3 +3,4 @@ transformers
 huggingface_hub
 optimum-intel[openvino]
 torchvision
+reverse_geocoder
