@@ -7,6 +7,7 @@ Phases:
                     offline reverse geocoding
     3. embed        CLIP embeddings, cluster into events within year-month
     3b. name events one Qwen call per cluster viewing a contact sheet
+                    (names cached by cluster membership, with resume)
     4. describe     one Qwen call per image -> structured slots
                     (with checkpoint resume)
     5. fill events  fallback event names from the images' own slots
@@ -30,6 +31,7 @@ from config import (
     CHECKPOINT_SCHEMA,
     COPY_INSTEAD_OF_MOVE,
     DRY_RUN,
+    EVENT_NAME_SCHEMA,
     IMAGE_EXTENSIONS,
     MAX_TOTAL_PATH_LENGTH,
     PROCESS_VIDEOS,
@@ -39,6 +41,7 @@ from config import (
 )
 from clustering import (
     cluster_images,
+    cluster_signature,
     embed_images,
     fallback_event_name,
     load_embedder,
@@ -61,8 +64,10 @@ from state import (
     append_log,
     checkpoint_matches_file,
     load_checkpoint,
+    load_event_names,
     load_index,
     save_checkpoint,
+    save_event_names,
     save_index,
 )
 from ui import counter, error, fmt_int, kv, note, section, warn
@@ -299,12 +304,56 @@ def organize_image_library(source_dir: str, target_dir: str) -> None:
 
     # ------------------------------------------------------------
     # Phase 3b: one Qwen call per cluster, viewing a contact sheet of
-    # its frames, names the event ("Newborn Photos").
+    # its frames, names the event ("Newborn Photos"). Names are cached
+    # by cluster membership, so a rerun only names new or changed
+    # clusters.
     # ------------------------------------------------------------
 
     section("Event naming")
 
-    event_names = name_events(model, processor, clusters)
+    event_cache: Dict[str, Dict[str, Any]] = {}
+
+    if ANALYSIS_CHECKPOINT and not DRY_RUN:
+        event_cache = load_event_names(target_path)
+
+    signatures = {
+        cluster_id: cluster_signature(paths)
+        for cluster_id, paths in clusters.items()
+    }
+
+    # Drop cached names whose clusters no longer exist unchanged.
+    live_signatures = set(signatures.values())
+    event_cache = {k: v for k, v in event_cache.items() if k in live_signatures}
+
+    event_names: Dict[int, str] = {}
+    to_name: Dict[int, List[Path]] = {}
+
+    for cluster_id, sig in signatures.items():
+        entry = event_cache.get(sig) if sig else None
+
+        if entry and entry.get("schema") == EVENT_NAME_SCHEMA and entry.get("name"):
+            event_names[cluster_id] = entry["name"]
+        else:
+            to_name[cluster_id] = clusters[cluster_id]
+
+    if event_names:
+        note(
+            f"{fmt_int(len(event_names))} event name(s) resumed from cache; "
+            f"naming {fmt_int(len(to_name))} remaining event(s)"
+        )
+
+    def remember_event_name(cluster_id: int, name: str) -> None:
+        # Cache the event name the moment it is produced, so an interrupted
+        # run does not re-run the Qwen call for this cluster.
+        sig = signatures.get(cluster_id, "")
+
+        if sig and not DRY_RUN:
+            event_cache[sig] = {"schema": EVENT_NAME_SCHEMA, "name": name}
+            save_event_names(target_path, event_cache)
+
+    event_names.update(
+        name_events(model, processor, to_name, on_named=remember_event_name)
+    )
 
     # ------------------------------------------------------------
     # Phase 4: per-image structured VLM analysis (with checkpoint

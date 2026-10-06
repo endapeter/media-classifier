@@ -8,6 +8,7 @@ gives the naming model the context a single image lacks, and keeps theme
 naming consistent across the whole event.
 """
 
+import hashlib
 import math
 import re
 from pathlib import Path
@@ -222,16 +223,45 @@ def fallback_event_name(slots: Dict[str, Any]) -> str:
     return ""
 
 
+def cluster_signature(image_paths: List[Path]) -> str:
+    """
+    Stable signature of a cluster: the sorted (path, size, mtime) of its
+    members, hashed.
+
+    A rerun over unchanged files re-derives the same signature, so a cached
+    event name can be reused; any changed, added, or removed member produces
+    a different signature and the event is named again. Returns "" if any
+    member cannot be stat'ed (cache cannot be used or written).
+    """
+    parts = []
+
+    for p in sorted(image_paths, key=str):
+        try:
+            st = p.stat()
+        except OSError:
+            return ""
+
+        parts.append(f"{p}|{st.st_size}|{st.st_mtime_ns}")
+
+    if not parts:
+        return ""
+
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
 def name_events(
     model: OVModelForVisualCausalLM,
     processor: AutoProcessor,
     clusters: Dict[int, List[Path]],
+    on_named=None,
 ) -> Dict[int, str]:
     """
     One Qwen call per cluster, viewing the cluster's contact sheet.
 
     Returns cluster id -> event name; clusters whose call fails are simply
-    absent from the dict (their images fall back later).
+    absent from the dict (their images fall back later). When on_named is
+    given, it is called as on_named(cluster_id, name) as soon as each name
+    is produced, so the caller can checkpoint it immediately.
     """
     names: Dict[int, str] = {}
 
@@ -258,6 +288,10 @@ def name_events(
 
             if name:
                 names[cluster_id] = name
+
+                if on_named is not None:
+                    on_named(cluster_id, name)
+
                 print(
                     f"{counter(idx, len(ordered))} {len(paths)} image(s) -> {name}"
                 )

@@ -91,13 +91,17 @@ DRY_RUN = False
 TIMING_WARMUP_IMAGES = 3
 
 # Persist each image's VLM analysis to a checkpoint file as soon as it is
-# produced. If the run is interrupted, the next run reuses the checkpointed
-# analyses and only infers the remaining images, instead of starting over.
-# Entries are keyed by source path and validated against file size and
-# modification time, so a changed file is re-analyzed. The schema number
-# also rejects entries written before the structured-slots refactor.
+# produced, and cache each event's name once its cluster has been named. If
+# the run is interrupted, the next run reuses the checkpointed analyses and
+# event names and only infers what is missing, instead of starting over.
+# Analysis entries are keyed by source path and validated against file size
+# and modification time, so a changed file is re-analyzed. Event names are
+# keyed by a signature of the cluster's membership, so a changed, added, or
+# removed image re-names its event. Schema numbers also reject entries
+# written before the structured-slots refactor.
 ANALYSIS_CHECKPOINT = True
 CHECKPOINT_SCHEMA = 2
+EVENT_NAME_SCHEMA = 1
 
 # If True, copies files instead of moving them.
 # Safer for first runs, but can create duplicates if index is removed.

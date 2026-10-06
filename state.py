@@ -58,7 +58,7 @@ def append_log(target_path: Path, entry: Dict[str, Any]) -> None:
 
 
 # ============================================================
-# Analysis checkpoint
+# Analysis checkpoint and event-name cache
 # ============================================================
 
 def load_checkpoint(target_path: Path) -> Dict[str, Dict[str, Any]]:
@@ -96,6 +96,44 @@ def save_checkpoint(target_path: Path, checkpoint: Dict[str, Dict[str, Any]]) ->
 
     except Exception as e:
         warn(f"could not save analysis checkpoint: {e}")
+
+
+def load_event_names(target_path: Path) -> Dict[str, Dict[str, Any]]:
+    """
+    Load the event-name cache: cluster signature -> event name.
+
+    Like the analysis checkpoint, this is written during the event-naming
+    phase, so an interrupted run can skip the Qwen calls for clusters it
+    already named.
+    """
+    cache_path = target_path / "_event_names.json"
+
+    if cache_path.exists():
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            return {}
+
+    return {}
+
+
+def save_event_names(target_path: Path, cache: Dict[str, Dict[str, Any]]) -> None:
+    cache_path = target_path / "_event_names.json"
+
+    try:
+        target_path.mkdir(parents=True, exist_ok=True)
+
+        tmp_path = cache_path.with_suffix(".tmp")
+        tmp_path.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(cache_path)
+
+    except Exception as e:
+        warn(f"could not save event-name cache: {e}")
 
 
 def checkpoint_matches_file(img_path: Path, entry: Dict[str, Any]) -> bool:
